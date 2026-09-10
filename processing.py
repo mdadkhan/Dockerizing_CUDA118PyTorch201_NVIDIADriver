@@ -44,7 +44,7 @@ def get_object_agatston(calc_object, calc_pixel_count):
     return object_agatston
 
 #input volume already must be in Hounsfeild Units -- #for_slice
-def compute_agatston_for_vol(input_vol_hu, mask, voxel_dims, min_calc_object_pixels=3):
+def compute_agatston_for_vol(input_vol_hu, mask, voxel_dims, min_calc_object_pixels=1): # default 1 matches compute_agatston_for_batch and the values used in the paper
     if np.sum(mask) == 0:
         return 0
     # Divide Voxel_vol by 3 to normalize to standard CAC 3mm slice thickness - inputs may have variable slice thickness. Agatston formula is based on area with 3mm slices.
