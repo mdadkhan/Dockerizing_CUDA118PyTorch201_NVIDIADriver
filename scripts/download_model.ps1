@@ -17,6 +17,8 @@ $ErrorActionPreference = "Stop"
 
 $MODEL_URL = "https://github.com/Raffi-Hagopian/AI-CAC/releases/download/v1.0.0/va_non_gated_ai_cac_model.pth"
 $MODEL_FILENAME = "va_non_gated_ai_cac_model.pth"
+# Same value the app checks before loading; override with $env:MODEL_SHA256.
+$MODEL_SHA256 = if ($env:MODEL_SHA256) { $env:MODEL_SHA256 } else { "cfded8253e64b81b963a314cb5adc90d30a1f21574638366b80c783676c1733d" }
 
 # Resolve model/ relative to this script's location so it works from any cwd
 $SCRIPT_DIR = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -73,6 +75,15 @@ if ($shouldDownload) {
 # Display final status
 $finalFile = Get-Item $MODEL_PATH
 $fileSizeMB = [math]::Round($finalFile.Length / 1MB, 2)
+
+# torch.load runs pickled code, so never keep weights that don't match the expected checksum.
+Write-Host "Verifying SHA-256..." -ForegroundColor Cyan
+$actualHash = (Get-FileHash -Path $MODEL_PATH -Algorithm SHA256).Hash.ToLower()
+if ($actualHash -ne $MODEL_SHA256.ToLower()) {
+    Remove-Item -LiteralPath $MODEL_PATH -Force
+    throw "Model checksum mismatch: expected $MODEL_SHA256, got $actualHash. The file was deleted."
+}
+Write-Host "Checksum OK." -ForegroundColor Green
 
 Write-Host "`nModel is ready:" -ForegroundColor Green
 Write-Host "  Path: $MODEL_PATH" -ForegroundColor White

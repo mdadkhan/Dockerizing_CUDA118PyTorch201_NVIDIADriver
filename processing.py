@@ -10,6 +10,49 @@ import re
 import torch
 from scipy import ndimage
 
+# AI-CAC was trained and validated on 2.5-5 mm axial slices. Series from 0.5 mm up to
+# 2.5 mm are reconstructed to 3 mm before inference; anything outside 0.5-5 mm is excluded.
+VALIDATED_SLICE_THICKNESS_MM = (2.5, 5.0)
+MIN_ACCEPTED_SLICE_THICKNESS_MM = 0.5
+RECONSTRUCTED_SLICE_THICKNESS_MM = 3.0
+
+def is_validated_slice_thickness(thickness_mm):
+    low, high = VALIDATED_SLICE_THICKNESS_MM
+    return low <= thickness_mm <= high
+
+def reconstruct_thin_slices(volume, voxel_resolution):
+    # Thin slices (< 2.5 mm) are interpolated along z to 3 mm (cubic), and the z voxel size
+    # becomes 3 mm so Agatston scoring uses the reconstructed thickness.
+    current_thickness = float(voxel_resolution[2])
+    if current_thickness >= VALIDATED_SLICE_THICKNESS_MM[0]:
+        return volume, voxel_resolution
+    z_zoom_factor = current_thickness / RECONSTRUCTED_SLICE_THICKNESS_MM
+    volume = ndimage.zoom(volume, (1, 1, z_zoom_factor), order=3)
+    voxel_resolution = [float(voxel_resolution[0]), float(voxel_resolution[1]), RECONSTRUCTED_SLICE_THICKNESS_MM]
+    return volume, voxel_resolution
+
+def slice_thickness_report(original_thickness_mm):
+    """Fields describing how a series' slice thickness was handled, for logs and the API response."""
+    original = float(original_thickness_mm)
+    if is_validated_slice_thickness(original):
+        return {
+            'original_slice_thickness_mm': original,
+            'reconstructed_to_mm': None,
+            'within_validated_range': True,
+            'warning': None,
+        }
+    low, high = VALIDATED_SLICE_THICKNESS_MM
+    warning = (
+        f'AI-CAC was validated on {low:g}\u2013{high:g} mm slice thickness. '
+        f'This series ({original:g} mm) was reconstructed to {RECONSTRUCTED_SLICE_THICKNESS_MM:g} mm. '
+        'Consider further validation.'
+    )
+    return {
+        'original_slice_thickness_mm': original,
+        'reconstructed_to_mm': RECONSTRUCTED_SLICE_THICKNESS_MM,
+        'within_validated_range': False,
+        'warning': warning,
+    }
 def load_pydicom_slices_by_axial_cord(tuples): # tuples consist of list of tuples (dicom slice file path, dicom slice axial position) for a given study 
     tuples.sort(key=lambda x: x[1], reverse = False)   #sort list of tuples inplace, by axial coordinate, true axial cord order is similar to reverse file order
     slices = [pydicom.read_file(tup[0]) for tup in tuples]

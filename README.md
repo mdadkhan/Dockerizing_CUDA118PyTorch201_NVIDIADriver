@@ -10,12 +10,25 @@ This repository contains:
 
 ## Requirements
 
-Install dependencies with: `'pip install -r requirements.txt'`
+If you don't have `pyenv` already, get it [here](https://github.com/pyenv/pyenv).
+Then navigate to the root directory of this project and set up the environment as follows:
+```
+pyenv install 3.9.19
+pyenv virtualenv 3.9.19 ai-cac
+pyenv local ai-cac
+pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+If you get `undefined symbol` errors when trying to run `main_inference.py`,
+it is possible that `torch` is attempting to access libraries from a different version
+of `python` (e.g. `3.12`). Inspect your environment closely, including the
+`PYTHONPATH` variable.
 
 ## Instructions for Inference (running AI-CAC scoring on non-gated, non-contrast chest CTs)
 
 1. Create a folder for each CT chest scan study and place DICOM files from that study within the folder. The folder name will be used as the name for that study.
-2. Modify the following hardcoded variables in `main_inference.py`:
+2. Set the following paths, either as environment variables of the same name or by editing the defaults in `main_inference.py` (`RESULTS_DIR`, default `results2`, sets the default folder for `SCORE_FILE` and `MASK_FOLDER`):
    * `DICOM_ROOT_DIR` – Set to the path of the parent folder that contains the non-gated study subfolders as described above.
    * `MODEL_CHECKPOINT_FILE` – Set to the path of the model weights (download: [va_non_gated_ai_cac_model.pth](https://github.com/Raffi-Hagopian/AI-CAC/releases/download/v1.0.0/va_non_gated_ai_cac_model.pth)).
    * `SCORE_FILE` – Set to the path where the final CSV table containing the study-level AI-CAC generated calcium scores will be saved.

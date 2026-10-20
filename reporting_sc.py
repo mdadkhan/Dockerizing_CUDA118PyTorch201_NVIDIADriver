@@ -62,8 +62,17 @@ def get_slice_position(ds):
         return None
 
 
+# Shown on every report page and written into every Secondary Capture. The DICOM text
+# uses a plain hyphen because the copied patient tags keep the source's character set.
+RESEARCH_USE_LABEL = "Research use only \u2013 not for diagnostic use"
+RESEARCH_USE_LABEL_DICOM = "Research use only - not for diagnostic use"
+
+
 def extract_png_slice_number(png_path: Path) -> int | None:
     """
+    The slice index the model saved the PNG under: the 0-based position of the slice in
+    the volume (see visualization.save_vol_masks).
+
     Examples:
       28.png -> 28
       28_no_mask.png -> 28
@@ -74,24 +83,58 @@ def extract_png_slice_number(png_path: Path) -> int | None:
     return int(m.group(1)) if m else None
 
 
-def extract_dicom_suffix_number(dcm_path: Path) -> int | None:
-    """
-    Example:
-      IM-0001-0028.dcm -> 28
-    """
-    m = re.search(r"-(\d+)$", dcm_path.stem)
-    return int(m.group(1)) if m else None
+def read_axial_position(ds) -> float | None:
+    """The z value of ImagePositionPatient, the key inference sorts the slices by."""
+    try:
+        return float(ds.ImagePositionPatient[2])
+    except Exception:
+        return None
 
 
-def build_dicom_suffix_map(study_dicom_folder: Path):
-    suffix_map = {}
+def sorted_slices_from_table(slice_table: Path, study_name: str) -> list[tuple[Path, float]]:
+    """
+    The study's slices in volume order, from the table inference writes
+    (dicom_input_one_series.csv). That table holds exactly the series the model used.
+    """
+    df = pd.read_csv(slice_table, dtype=str)
+    rows = df[df["StudyName"] == study_name]
+    slices = [(Path(p), float(z)) for p, z in zip(rows["DICOMFilePath"], rows["AxialPosition"])]
+    missing = [p for p, _ in slices if not p.is_file()]
+    if missing:
+        raise ValueError(f"{len(missing)} DICOM file(s) listed in {slice_table} were not found, e.g. {missing[0]}")
+    # Stable sort by axial position, as processing.load_pydicom_slices_by_axial_cord does.
+    slices.sort(key=lambda s: s[1])
+    return slices
+
+
+def sorted_slices_from_folder(study_dicom_folder: Path) -> list[tuple[Path, float]]:
+    """
+    The study's slices in volume order, read from the DICOM folder. Only valid when the
+    folder holds one series, because inference picks one series per study and the folder
+    alone cannot say which.
+    """
+    slices = []
+    series_uids = set()
     for f in sorted(study_dicom_folder.glob("*")):
         if not f.is_file():
             continue
-        suffix_num = extract_dicom_suffix_number(f)
-        if suffix_num is not None:
-            suffix_map[suffix_num] = f
-    return suffix_map
+        try:
+            ds = dcmread(str(f), stop_before_pixels=True, force=True)
+        except Exception:
+            continue
+        z = read_axial_position(ds)
+        if z is None:
+            continue
+        series_uids.add(str(getattr(ds, "SeriesInstanceUID", "")))
+        slices.append((f, z))
+
+    if len(series_uids) > 1:
+        raise ValueError(
+            f"{study_dicom_folder} holds {len(series_uids)} series, so the slices the model used "
+            "cannot be told apart; pass --slice_table (results/dicom_input_one_series.csv from inference)"
+        )
+    slices.sort(key=lambda s: s[1])
+    return slices
 
 
 def sort_pngs_within_slice(png_list: list[Path]) -> list[Path]:
@@ -130,73 +173,34 @@ def group_pngs_by_slice(study_png_folder: Path):
 
     return grouped, unmatched
 
-def order_pngs_by_matched_dicoms(study_png_folder: Path, study_dicom_folder: Path):
+def match_pngs_to_slices(study_png_folder: Path, slices: list[tuple[Path, float]]):
     """
-    Match PNG groups to DICOMs by numeric slice suffix.
+    Match each mask PNG to its DICOM by position in the sorted volume.
 
-    Example:
-      28.png + 28_no_mask.png -> IM-0001-0028.dcm
-      30.png + 30_no_mask.png -> IM-0001-0030.dcm
+    PNG N is slice index N of the volume the model saw, i.e. the N-th DICOM (0-based)
+    when the series is sorted by ascending axial position. The DICOM file name plays
+    no part. Pages are ordered superior to inferior (highest axial position first).
 
-    Rule:
-      - If ALL matched slices have geometry, sort by slice position.
-      - If ANY matched slice is missing geometry, ignore geometry entirely
-        and sort ALL matched slices by ascending InstanceNumber.
-      - If InstanceNumber is missing, fall back to slice_num.
+    PNGs whose number is not a slice of the volume are returned as unmatched.
     """
     grouped_pngs, unmatched_pngs = group_pngs_by_slice(study_png_folder)
-    dicom_suffix_map = build_dicom_suffix_map(study_dicom_folder)
 
     matched_groups = []
     unmatched_slice_groups = []
 
-    for slice_num, png_group in grouped_pngs.items():
-        dcm_path = dicom_suffix_map.get(slice_num)
-        if dcm_path is None:
+    for slice_index, png_group in grouped_pngs.items():
+        if slice_index >= len(slices):
             unmatched_slice_groups.extend(png_group)
             continue
+        dcm_path, slice_pos = slices[slice_index]
+        matched_groups.append({
+            "slice_index": slice_index,
+            "png_group": png_group,
+            "dcm_path": dcm_path,
+            "slice_pos": slice_pos,
+        })
 
-        try:
-            ds = dcmread(str(dcm_path), stop_before_pixels=True, force=True)
-            matched_groups.append({
-                "slice_num": slice_num,
-                "png_group": png_group,
-                "dcm_path": dcm_path,
-                "instance_number": getattr(ds, "InstanceNumber", None),
-                "slice_pos": get_slice_position(ds),
-            })
-        except Exception:
-            unmatched_slice_groups.extend(png_group)
-
-    if not matched_groups:
-        unmatched_all = unmatched_pngs + unmatched_slice_groups
-        return [], [], unmatched_all
-
-    # New rule:
-    # If any matched slice lacks geometry, ignore geometry for all and use ascending InstanceNumber.
-    any_missing_geometry = any(x["slice_pos"] is None for x in matched_groups)
-
-    if any_missing_geometry:
-        ordered_groups = sorted(
-            matched_groups,
-            key=lambda x: (
-                x["instance_number"] is None,
-                x["instance_number"] if x["instance_number"] is not None else 10**9,
-                x["slice_num"],
-            )
-        )
-        print("[ORDER MODE] Geometry incomplete for at least one matched slice; using ascending InstanceNumber for all matched slices.")
-
-    else:
-        ordered_groups = sorted(matched_groups, key=lambda x: x["slice_pos"], reverse=True)
-        print("[ORDER MODE] Geometry available for all matched slices; using superior-to-inferior slice position ordering.")
-
-        # Flip to True only if testing shows your data is reversed.
-        force_reverse_to_superior_inferior = False
-        if force_reverse_to_superior_inferior:
-            ordered_groups = list(reversed(ordered_groups))
-
-        print("[ORDER MODE] Geometry available for all matched slices; using slice position ordering.")
+    ordered_groups = sorted(matched_groups, key=lambda x: (x["slice_pos"], x["slice_index"]), reverse=True)
 
     ordered_pngs = []
     matched_dicoms = []
@@ -240,7 +244,7 @@ def make_sc_from_image(
     series_uid: str,
     instance_number: int,
     series_number: int = 900,
-    series_description: str = "AI-CAC Report Secondary Capture",
+    series_description: str = "VA-AI-CAC Report (research use only)",
 ):
     img_bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
     if img_bgr is None:
@@ -284,6 +288,8 @@ def make_sc_from_image(
     ds.SeriesNumber = series_number
     ds.InstanceNumber = instance_number
     ds.SeriesDescription = series_description
+    ds.ImageComments = RESEARCH_USE_LABEL_DICOM
+    ds.BurnedInAnnotation = "YES"
 
     ds.ContentDate = now.strftime("%Y%m%d")
     ds.ContentTime = now.strftime("%H%M%S")
@@ -316,11 +322,16 @@ def make_sc_from_image(
     dcmwrite(str(out_path), ds, write_like_original=False)
 
 
-def generate_pdf_and_sc_reports(mask_root, score_file, pdf_output_dir, studies_root, sc_output_dir):
+def generate_pdf_and_sc_reports(mask_root, score_file, pdf_output_dir, studies_root, sc_output_dir, slice_table=None):
     mask_root = Path(mask_root)
     pdf_output_dir = Path(pdf_output_dir)
     studies_root = Path(studies_root)
     sc_output_dir = Path(sc_output_dir)
+    slice_table = Path(slice_table) if slice_table else None
+
+    if slice_table is not None and not slice_table.is_file():
+        print(f"Error: Slice table {slice_table} does not exist.")
+        return
 
     pdf_output_dir.mkdir(parents=True, exist_ok=True)
     sc_output_dir.mkdir(parents=True, exist_ok=True)
@@ -358,15 +369,28 @@ def generate_pdf_and_sc_reports(mask_root, score_file, pdf_output_dir, studies_r
 
         source_ds = dcmread(str(source_dcm_path), force=True)
 
-        images, matched_dicoms, unmatched_pngs = order_pngs_by_matched_dicoms(
+        try:
+            if slice_table is not None:
+                slices = sorted_slices_from_table(slice_table, study_name)
+            else:
+                slices = sorted_slices_from_folder(source_study_folder)
+        except ValueError as e:
+            print(f"Skipping {study_name}: {e}")
+            continue
+
+        if not slices:
+            print(f"Skipping {study_name}: No slices found for this study in {slice_table or source_study_folder}")
+            continue
+
+        images, matched_dicoms, unmatched_pngs = match_pngs_to_slices(
             study_png_folder=study_path,
-            study_dicom_folder=source_study_folder,
+            slices=slices,
         )
 
         print_order_check(study_name, matched_dicoms)
 
         if unmatched_pngs:
-            print(f"[WARN] {study_name}: {len(unmatched_pngs)} PNG(s) did not match a DICOM suffix")
+            print(f"[WARN] {study_name}: {len(unmatched_pngs)} PNG(s) did not match a slice of the sorted volume ({len(slices)} slices)")
             for p in unmatched_pngs[:10]:
                 print(f"        Unmatched PNG: {p.name}")
 
@@ -395,6 +419,17 @@ def generate_pdf_and_sc_reports(mask_root, score_file, pdf_output_dir, studies_r
                     fontsize=30,
                     fontweight="bold",
                     y=0.97,
+                )
+
+                fig.text(
+                    0.5,
+                    0.995,
+                    RESEARCH_USE_LABEL,
+                    ha="center",
+                    va="top",
+                    fontsize=22,
+                    fontweight="bold",
+                    color="red",
                 )
 
                 fig.text(
@@ -451,7 +486,7 @@ def generate_pdf_and_sc_reports(mask_root, score_file, pdf_output_dir, studies_r
                     series_uid=sc_series_uid,
                     instance_number=p + 1,
                     series_number=900,
-                    series_description="VA-AI-CAC Report Secondary Capture",
+                    series_description="VA-AI-CAC Report (research use only)",
                 )
 
                 temp_png.unlink(missing_ok=True)
@@ -469,6 +504,12 @@ if __name__ == "__main__":
     parser.add_argument("--pdf_output_dir", type=str, default="results2/reports_pdf")
     parser.add_argument("--studies_dir", type=str, default="studies2")
     parser.add_argument("--sc_output_dir", type=str, default="results2/reports_sc")
+    parser.add_argument(
+        "--slice_table",
+        type=str,
+        default=None,
+        help="dicom_input_one_series.csv written by inference. Required when a study folder holds more than one series.",
+    )
 
     args = parser.parse_args()
 
@@ -478,4 +519,5 @@ if __name__ == "__main__":
         pdf_output_dir=args.pdf_output_dir,
         studies_root=args.studies_dir,
         sc_output_dir=args.sc_output_dir,
+        slice_table=args.slice_table,
     )

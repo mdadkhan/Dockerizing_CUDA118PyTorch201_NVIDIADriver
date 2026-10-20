@@ -31,8 +31,11 @@ class CTChestDataset_nongated(Dataset):
           volume, voxel_resolution = get_pixels_hu(load_pydicom_slices_by_axial_cord(files)) # make sure order of slices matches that for segmentations 
         except Exception as e:
           print(f"Error loading study{study_id}: {e}")
-          return study_id+'_corrupt', torch.zeros(512, 512, 64), torch.zeros(1), torch.zeros(512,512,64), np.array([0,0,0]) #dummy variables to skip for corrupt data 
+          return study_id+'_corrupt', torch.zeros(512, 512, 64), torch.zeros(1), torch.zeros(512,512,64), np.array([0,0,0]), 0.0 #dummy variables to skip for corrupt data 
         
+        original_slice_thickness = float(voxel_resolution[2])
+        volume, voxel_resolution = reconstruct_thin_slices(volume, voxel_resolution)
+
         h, w, z_length = volume.shape
         new_shape = self.new_shape 
         zoom_factors = self.zoom_factors
@@ -47,5 +50,5 @@ class CTChestDataset_nongated(Dataset):
         
         label = self.study_labels[idx]
         
-        return study_id, volume, torch.tensor(label, dtype=torch.float), hu_zoom_vol, zoom_voxel #if a transformation/normalization is applied to volume, then volume and hu_vol are different 
+        return study_id, volume, torch.tensor(label, dtype=torch.float), hu_zoom_vol, zoom_voxel, original_slice_thickness #if a transformation/normalization is applied to volume, then volume and hu_vol are different 
 

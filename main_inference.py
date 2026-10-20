@@ -27,11 +27,13 @@ ZOOM_FACTORS = (1, 1, 1)
 SAVE_MASKS = False # Save PNGs of AI-CAC segmentations
 VISUALIZE_RESULTS = False # Display segmentation masks during inference
 
-DICOM_ROOT_DIR = 'studies2'
-MODEL_CHECKPOINT_FILE = os.path.join('model', 'va_non_gated_ai_cac_model.pth')
+# Each path can be set with the environment variable of the same name; the values are the defaults.
+DICOM_ROOT_DIR = os.environ.get('DICOM_ROOT_DIR', 'studies2')
+MODEL_CHECKPOINT_FILE = os.environ.get('MODEL_CHECKPOINT_FILE', os.path.join('model', 'va_non_gated_ai_cac_model.pth'))
 
-SCORE_FILE = 'results2\scores.csv'
-MASK_FOLDER = 'results2\predicted_masks'
+RESULTS_DIR = os.environ.get('RESULTS_DIR', 'results2')
+SCORE_FILE = os.environ.get('SCORE_FILE', os.path.join(RESULTS_DIR, 'scores.csv'))
+MASK_FOLDER = os.environ.get('MASK_FOLDER', os.path.join(RESULTS_DIR, 'predicted_masks'))
 
 def main():
   score_data = []
@@ -85,7 +87,7 @@ def main():
 
   model = nn.DataParallel(model)
 
-  checkpoint = torch.load(MODEL_CHECKPOINT_FILE)
+  checkpoint = torch.load(MODEL_CHECKPOINT_FILE, weights_only=True) # refuses to unpickle arbitrary objects
   model.load_state_dict(checkpoint['model_state_dict'])
 
   device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -96,9 +98,12 @@ def main():
   model.eval()
   torch.cuda.empty_cache()
   with torch.no_grad():
-    for study_id, inputs, targets, hu_vols, vox_dims in input_loader:
+    for study_id, inputs, targets, hu_vols, vox_dims, original_thickness in input_loader:
       i += 1
       study_id = study_id[0] # size one batch, first id is only id
+      thickness_info = slice_thickness_report(float(original_thickness[0]))
+      if thickness_info['warning']:
+        print(f"WARNING: {thickness_info['warning']} (study {study_id})")
       inputs = inputs.to(device)
       num_slices = inputs.shape[4]
 
@@ -132,7 +137,7 @@ def main():
       pred_cacs = compute_agatston_for_batch(inputs.cpu(), pred_vol.cpu(), vox_dims)
 
       print(i, study_id, pred_cacs[0])
-      row = {'StudyName': study_id, 'AI-CAC': pred_cacs[0]}
+      row = {'StudyName': study_id, 'AI-CAC': pred_cacs[0], **thickness_info}
       score_data.append(row)
 
       # Save predicted masks when enabled or when a positive CAC score is predicted
@@ -148,6 +153,7 @@ def main():
         draw_first_positive(inputs.cpu(), pred_vol.cpu(), pred_vol.cpu(),0)
 
   score_df = pd.DataFrame(score_data)
+  os.makedirs(os.path.dirname(SCORE_FILE) or '.', exist_ok=True)
   score_df.to_csv(SCORE_FILE, index=False)
 
 

@@ -8,6 +8,7 @@ import pydicom
 import pandas as pd 
 import matplotlib.pyplot as plt
 
+from processing import VALIDATED_SLICE_THICKNESS_MM, MIN_ACCEPTED_SLICE_THICKNESS_MM
 # Extract selected attributes using pydicom 
 def extract_dicom_attributes(dicom_file):
     attributes = {
@@ -87,8 +88,10 @@ def create_dicom_df(root_dir):
 #  2) Non-contrast 
 #  3) Axial in Orientation
 #  4) No Study, Series, or Body Part descriptors containing non-chest anatomy words [head, skull, brain, ... etc]
-#  5) Of the remaining series, select the first series in order of the following descriptors [calc, casc, cac, ca]
-#  6) If none of the above words match series/body part descriptors, select the first remaining series in the dataframe
+#  5) Slice thickness 0.5-5 mm; a native 2.5-5 mm series (the validated range) is preferred over a thinner one,
+#     which is reconstructed to 3 mm at inference
+#  6) Of the remaining series, select the first series in order of the following descriptors [calc, casc, cac, ca]
+#  7) If none of the above words match series/body part descriptors, select the first remaining series in the dataframe
  
 def filter_dicom_df(dicom_df):
 
@@ -101,9 +104,8 @@ def filter_dicom_df(dicom_df):
             int_list = [int(round(float(x))) for x in orientation_list]
             if len(int_list) < 6:
                 return False
-            abs_list = [abs(x) for x in int_list[:6]]
-            # Accept axial orientation even if the direction is flipped (sign differences)
-            return abs_list == [1,0,0,0,1,0]
+            # Standard axial only: flipped orientations are excluded because the volume is not reoriented before inference
+            return int_list[:6] == [1,0,0,0,1,0]
         except Exception:
             return False
     
@@ -141,6 +143,10 @@ def filter_dicom_df(dicom_df):
         return True 
   
     def select_row(group):
+        thickness = pd.to_numeric(group['SliceThickness'], errors='coerce')
+        native = group[(thickness >= VALIDATED_SLICE_THICKNESS_MM[0]) & (thickness <= VALIDATED_SLICE_THICKNESS_MM[1])]
+        if not native.empty:
+            group = native
         series_desc = group['SeriesDescription'].str.lower() # set to lower case
         body_part = group['BodyPartExamined'].str.lower()
         # Return the first series for this study that satisfies this search
@@ -191,8 +197,8 @@ def filter_dicom_df(dicom_df):
     else:
         dicom_df = dicom_df.iloc[0:0]
     dicom_df['SliceThickness'] =  pd.to_numeric(dicom_df['SliceThickness'], errors='coerce')
-    # Allow thinner-slice CTs (e.g., 0.625 mm) commonly found in LDCT datasets
-    dicom_df = dicom_df[(dicom_df['SliceThickness'] >= 0.5) & (dicom_df['SliceThickness'] <= 5)] # Keep DICOMs with SliceThickness between 0.5 and 5
+    # Thin series (0.5 to < 2.5 mm) are kept but reconstructed to 3 mm at inference; see processing.py
+    dicom_df = dicom_df[(dicom_df['SliceThickness'] >= MIN_ACCEPTED_SLICE_THICKNESS_MM) & (dicom_df['SliceThickness'] <= VALIDATED_SLICE_THICKNESS_MM[1])]
     dicom_df.fillna('None', inplace = True) # Replace NA with string 'None'
     dicom_df = dicom_df.astype(str) # allows for grouping in certain columns 
     # If dicom_df is empty after filtering, return an empty dataframe with expected columns

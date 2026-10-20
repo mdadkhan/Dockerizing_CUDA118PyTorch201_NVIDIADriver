@@ -7,15 +7,20 @@ import os
 os.environ["MPLBACKEND"] = "Agg"
 
 import uuid
+import time
+import shutil
 import zipfile
-import traceback
 from pathlib import Path as FilePath
 
 from flask import Flask, request, jsonify, send_from_directory, redirect
 from werkzeug.utils import secure_filename
 
-from cac_inference_service import CACSInferenceService
+from cac_inference_service import CACSInferenceService, StudyInputError, DEFAULT_MODEL_SHA256
 from s3_storage import S3StorageService
+
+
+def env_flag(name: str, default: str = "false") -> bool:
+    return os.environ.get(name, default).lower() in {"true", "1", "yes"}
 
 
 # -----------------------------
@@ -26,12 +31,24 @@ MODEL_CHECKPOINT_FILE = os.environ.get(
     "MODEL_CHECKPOINT_FILE",
     os.path.join("model", "va_non_gated_ai_cac_model.pth"),
 )
+MODEL_SHA256 = os.environ.get("MODEL_SHA256", DEFAULT_MODEL_SHA256)
 
 # S3 Configuration
-USE_S3_STORAGE = os.environ.get("USE_S3_STORAGE", "false").lower() in {"true", "1", "yes"}
+USE_S3_STORAGE = env_flag("USE_S3_STORAGE")
 S3_BUCKET_NAME = os.environ.get("S3_BUCKET_NAME", "")
 S3_PREFIX = os.environ.get("S3_PREFIX", "RADFLOW/outputs/ai-cac-outputs")
 S3_URL_EXPIRATION = int(os.environ.get("S3_URL_EXPIRATION", "3600"))  # 1 hour default
+
+# Upload limits (zip-bomb protection)
+MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "1024"))
+MAX_UNCOMPRESSED_MB = int(os.environ.get("MAX_UNCOMPRESSED_MB", "4096"))
+MAX_ZIP_FILES = int(os.environ.get("MAX_ZIP_FILES", "10000"))
+
+# PHI retention: inputs are deleted after every request; outputs are kept this long (0 = no limit)
+OUTPUT_RETENTION_HOURS = float(os.environ.get("OUTPUT_RETENTION_HOURS", "24"))
+WRITE_DEBUG_CSVS = env_flag("WRITE_DEBUG_CSVS")
+# Input folders left behind by a killed worker are removed after this many hours.
+INCOMING_STALE_HOURS = 6
 
 BASE_STORAGE = FilePath("storage")
 
@@ -57,6 +74,8 @@ if not USE_S3_STORAGE:
 # -----------------------------
 
 app = Flask(__name__)
+# Requests larger than this are rejected with 413 before the upload is stored.
+app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
 
 
 # -----------------------------
@@ -104,6 +123,8 @@ cac_service = CACSInferenceService(
     batch_size=int(os.environ.get("INFERENCE_BATCH_SIZE", "16")),
     num_workers=int(os.environ.get("DATALOADER_NUM_WORKERS", "4")),
     s3_service=s3_service,
+    write_debug_csvs=WRITE_DEBUG_CSVS,
+    model_sha256=MODEL_SHA256,
 )
 
 print("AI-CAC service loaded successfully.")
@@ -113,20 +134,62 @@ print("AI-CAC service loaded successfully.")
 # Helpers
 # -----------------------------
 
+class UploadRejected(ValueError):
+    """The uploaded zip breaks a safety limit. The message is safe to return to the client."""
+
+
 def safe_extract_zip(zip_path: FilePath, extract_dir: FilePath):
     """
-    Safely extract a zip file while preventing path traversal.
+    Extract a zip file, rejecting path traversal and enforcing the file-count and
+    total-uncompressed-size limits. Sizes are counted while extracting, not taken
+    from the zip headers, which an attacker controls.
     """
     extract_dir = extract_dir.resolve()
+    max_bytes = MAX_UNCOMPRESSED_MB * 1024 * 1024
 
     with zipfile.ZipFile(zip_path, "r") as zip_ref:
-        for member in zip_ref.infolist():
+        members = [m for m in zip_ref.infolist() if not m.is_dir()]
+
+        if len(members) > MAX_ZIP_FILES:
+            raise UploadRejected(f"The zip contains more than {MAX_ZIP_FILES} files.")
+        if sum(m.file_size for m in members) > max_bytes:
+            raise UploadRejected(f"The zip expands to more than {MAX_UNCOMPRESSED_MB} MB.")
+
+        written = 0
+        for member in members:
             target_path = (extract_dir / member.filename).resolve()
+            if not target_path.is_relative_to(extract_dir):
+                raise UploadRejected("The zip contains an unsafe file path.")
 
-            if not str(target_path).startswith(str(extract_dir)):
-                raise ValueError(f"Unsafe zip path detected: {member.filename}")
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            with zip_ref.open(member) as src, open(target_path, "wb") as dst:
+                for chunk in iter(lambda: src.read(1024 * 1024), b""):
+                    written += len(chunk)
+                    if written > max_bytes:
+                        raise UploadRejected(f"The zip expands to more than {MAX_UNCOMPRESSED_MB} MB.")
+                    dst.write(chunk)
 
-        zip_ref.extractall(extract_dir)
+
+def purge_old_request_dirs(root: FilePath, max_age_hours: float) -> None:
+    """Delete per-request folders under root older than max_age_hours (0 = keep)."""
+    if max_age_hours <= 0 or not root.is_dir():
+        return
+    cutoff = time.time() - max_age_hours * 3600
+    for entry in root.iterdir():
+        try:
+            if entry.is_dir() and entry.stat().st_mtime < cutoff:
+                shutil.rmtree(entry, ignore_errors=True)
+        except OSError:
+            pass
+
+
+def purge_expired_data() -> None:
+    purge_old_request_dirs(INCOMING_ROOT, INCOMING_STALE_HOURS)
+    purge_old_request_dirs(MASK_ROOT, OUTPUT_RETENTION_HOURS)
+    purge_old_request_dirs(DEBUG_ROOT, OUTPUT_RETENTION_HOURS)
+
+
+purge_expired_data()
 
 
 def list_extracted_files(folder: FilePath, max_files: int = 20):
@@ -147,21 +210,16 @@ def list_extracted_files(folder: FilePath, max_files: int = 20):
 
 def local_mask_path_to_url(mask_file: str) -> str:
     """
-    Convert storage/outputs/masks/... path into /masks/... URL (local mode)
-    or S3 URI (S3 mode).
+    Convert a stored mask (local path, or S3 key in S3 mode) into this API's /masks/... URL.
+    In S3 mode that URL redirects to a short-lived presigned URL, so the bucket stays private.
     """
-    if USE_S3_STORAGE and s3_service:
-        # For S3 mode, mask_file contains the S3 key
-        # Return S3 URI format: s3://bucket/key
-        return f"s3://{S3_BUCKET_NAME}/{mask_file}"
-    else:
-        # For local mode, convert file path to local URL
-        mask_path = FilePath(mask_file).resolve()
-        mask_root_resolved = MASK_ROOT.resolve()
-        
-        relative_path = mask_path.relative_to(mask_root_resolved)
-        
-        return f"/masks/{relative_path.as_posix()}"
+    s3_mask_prefix = f"{S3_PREFIX}/masks/".lstrip("/")
+    if USE_S3_STORAGE and s3_service and mask_file.startswith(s3_mask_prefix):
+        return f"/masks/{mask_file[len(s3_mask_prefix):]}"
+
+    mask_path = FilePath(mask_file).resolve()
+    relative_path = mask_path.relative_to(MASK_ROOT.resolve())
+    return f"/masks/{relative_path.as_posix()}"
 
 
 # -----------------------------
@@ -182,24 +240,25 @@ def index():
 
 @app.route("/health", methods=["GET"])
 def health():
-    health_data = {
-        "success": True,
-        "status": "ok",
-        "model_loaded": True,
-        "device": str(cac_service.device),
-        "model_checkpoint_file": MODEL_CHECKPOINT_FILE,
-        "incoming_root": str(INCOMING_ROOT),
-        "storage_mode": "s3" if USE_S3_STORAGE else "local",
-    }
-    
-    if USE_S3_STORAGE:
-        health_data["s3_bucket"] = S3_BUCKET_NAME
-        health_data["s3_prefix"] = S3_PREFIX
-    else:
-        health_data["mask_root"] = str(MASK_ROOT)
-        health_data["debug_root"] = str(DEBUG_ROOT)
-    
-    return jsonify(health_data)
+    return jsonify(
+        {
+            "success": True,
+            "status": "ok",
+            "model_loaded": True,
+            "device": str(cac_service.device),
+            "storage_mode": "s3" if USE_S3_STORAGE else "local",
+        }
+    )
+
+
+@app.errorhandler(413)
+def upload_too_large(_error):
+    return jsonify(
+        {
+            "success": False,
+            "error": f"Upload exceeds the {MAX_UPLOAD_MB} MB limit.",
+        }
+    ), 413
 
 
 @app.route("/predict", methods=["POST"])
@@ -230,6 +289,7 @@ def predict():
         ), 400
 
     request_id = uuid.uuid4().hex
+    purge_expired_data()
 
     save_masks_raw = request.form.get("save_masks", "true").strip().lower()
     save_masks = save_masks_raw in {"true", "1", "yes", "y"}
@@ -268,20 +328,20 @@ def predict():
         for study_result in result.get("results", []):
             mask_urls = []
 
-            for mask_file in study_result.get("mask_files", []):
+            # mask_files/mask_dir are server paths or S3 keys; only API URLs go to the client.
+            for mask_file in study_result.pop("mask_files", []):
                 try:
                     mask_urls.append(local_mask_path_to_url(mask_file))
                 except Exception:
                     pass
 
+            study_result.pop("mask_dir", None)
             study_result["mask_urls"] = mask_urls
 
         return jsonify(
             {
                 "success": True,
                 "request_id": request_id,
-                "dicom_input_dir": str(dicom_extract_dir),
-                "mask_output_root": str(MASK_ROOT / request_id),
                 **result,
             }
         ), 200
@@ -295,53 +355,74 @@ def predict():
             }
         ), 400
 
-    except Exception as e:
-        traceback.print_exc()
-
+    except UploadRejected as e:
         return jsonify(
             {
                 "success": False,
                 "request_id": request_id,
                 "error": str(e),
-                "traceback": traceback.format_exc(),
-                "dicom_input_dir": str(dicom_extract_dir),
-                "mask_output_root": str(MASK_ROOT / request_id),
+            }
+        ), 400
+
+    except StudyInputError as e:
+        return jsonify(
+            {
+                "success": False,
+                "request_id": request_id,
+                "error": str(e),
+            }
+        ), 422
+
+    except Exception:
+        # Details stay in the server log; the client only gets the request_id to quote.
+        app.logger.exception("Prediction failed for request_id=%s", request_id)
+
+        return jsonify(
+            {
+                "success": False,
+                "request_id": request_id,
+                "error": "Internal error while processing the study. Quote the request_id when reporting it.",
             }
         ), 500
+
+    finally:
+        # The uploaded zip and extracted DICOMs are PHI; never keep them after the request.
+        shutil.rmtree(request_dir, ignore_errors=True)
 
 
 @app.route("/masks/<path:filename>", methods=["GET"])
 def get_mask(filename):
     """
-    Serves saved mask PNGs from storage/outputs/masks (local mode)
-    or redirects to S3 (S3 mode).
+    Serves saved mask PNGs from storage/outputs/masks (local mode), or redirects to a
+    short-lived presigned S3 URL (S3 mode). The bucket itself must stay private.
     """
-    if USE_S3_STORAGE and s3_service:
-        # In S3 mode, generate public S3 URL and redirect
-        s3_key = f"{S3_PREFIX}/masks/{filename}"
-        public_url = s3_service.get_public_url(s3_key)
-        return redirect(public_url)
-    else:
-        # In local mode, serve from local directory
-        return send_from_directory(MASK_ROOT, filename)
+    if USE_S3_STORAGE and s3_service and not (MASK_ROOT / filename).is_file():
+        s3_key = f"{S3_PREFIX}/masks/{filename}".lstrip("/")
+        return redirect(s3_service.generate_presigned_url(s3_key))
+    return send_from_directory(MASK_ROOT.resolve(), filename)
 
 
 print("Reached bottom of app.py")
 print("__name__ is:", __name__)
 
 if __name__ == "__main__":
-    print("Starting AI-CAC Flask server...")
-    print("Open: http://127.0.0.1:25000/health")
+    # Local development only; the container runs gunicorn and never reaches this.
+    host = os.environ.get("FLASK_HOST", "0.0.0.0")
+    port = int(os.environ.get("FLASK_PORT", "25000"))
 
-    # Read debug mode from environment variable
-    debug_mode = os.environ.get("FLASK_DEBUG", "false").lower() in {"true", "1", "yes"}
-    
+    debug_mode = env_flag("FLASK_DEBUG")
+
     if debug_mode:
-        print("⚠️  DEBUG MODE ENABLED - Auto-reload on code changes")
-    
+        # The Werkzeug debugger allows remote code execution, so never expose it beyond this machine.
+        host = "127.0.0.1"
+        print("⚠️  DEBUG MODE ENABLED - Auto-reload on code changes (listening on 127.0.0.1 only)")
+
+    print("Starting AI-CAC Flask server...")
+    print(f"Open: http://127.0.0.1:{port}/health")
+
     app.run(
-        host="0.0.0.0",
-        port=25000,
+        host=host,
+        port=port,
         debug=debug_mode,
         use_reloader=debug_mode,
     )

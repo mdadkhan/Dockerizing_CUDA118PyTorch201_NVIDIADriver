@@ -1,4 +1,5 @@
 import os
+import hashlib
 import uuid
 from pathlib import Path as FilePath
 from typing import Dict, Any, List
@@ -30,7 +31,7 @@ except ImportError:
     from dataset_generator_inference import *
 
 try:
-    from processing import compute_agatston_for_batch
+    from processing import compute_agatston_for_batch, slice_thickness_report
 except ImportError:
     from processing import *
 
@@ -38,6 +39,28 @@ try:
     from visualization import save_vol_masks
 except ImportError:
     from visualization import *
+
+
+# SHA-256 of va_non_gated_ai_cac_model.pth from the AI-CAC v1.0.0 GitHub release
+# (1,205,817,465 bytes). The release does not publish a checksum; confirm with the model author.
+DEFAULT_MODEL_SHA256 = "cfded8253e64b81b963a314cb5adc90d30a1f21574638366b80c783676c1733d"
+
+
+class StudyInputError(ValueError):
+    """A problem with the uploaded study that the client can fix. The message is safe to return."""
+
+
+def verify_sha256(path: str, expected: str) -> None:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    actual = digest.hexdigest()
+    if actual != expected.strip().lower():
+        raise RuntimeError(
+            f"Model checksum mismatch for {path}: expected SHA-256 {expected}, got {actual}. "
+            "Refusing to load the weights."
+        )
 
 
 class CACSInferenceService:
@@ -49,8 +72,13 @@ class CACSInferenceService:
         batch_size: int = 8,
         num_workers: int = 0,
         s3_service=None,
+        write_debug_csvs: bool = False,
+        model_sha256: str = DEFAULT_MODEL_SHA256,
     ):
         self.model_checkpoint_file = model_checkpoint_file
+        self.model_sha256 = model_sha256
+        # Debug CSVs hold study metadata and file paths, so they are only written on request.
+        self.write_debug_csvs = write_debug_csvs
 
         # IMPORTANT:
         # Use FilePath, not Path.
@@ -106,9 +134,14 @@ class CACSInferenceService:
         # checkpoint['model_state_dict'], so we preserve that.
         model = nn.DataParallel(model)
 
+        verify_sha256(self.model_checkpoint_file, self.model_sha256)
+        print("Model checksum verified.")
+
+        # weights_only refuses to unpickle anything but tensors and plain containers.
         checkpoint = torch.load(
             self.model_checkpoint_file,
             map_location=self.device,
+            weights_only=True,
         )
 
         if "model_state_dict" not in checkpoint:
@@ -186,9 +219,9 @@ class CACSInferenceService:
             )
 
         if filtered_df.empty:
-            raise ValueError(
-                "No usable CT series found after filter_dicom_df(). "
-                "Check whether the uploaded zip contains valid DICOM CT files."
+            raise StudyInputError(
+                "No usable CT series found. The study needs a non-contrast axial chest CT series "
+                "with 0.5-5 mm slices and more than 15 images."
             )
 
         bad_axial = filtered_df[
@@ -227,9 +260,7 @@ class CACSInferenceService:
         dicom_df = create_dicom_df(str(dicom_root))
 
         if dicom_df is None or dicom_df.empty:
-            raise ValueError(
-                f"No DICOM records found by create_dicom_df() in: {dicom_root}"
-            )
+            raise StudyInputError("No DICOM (.dcm) files were found in the uploaded zip.")
 
         print("DICOM DF Created:", dicom_df.shape)
 
@@ -251,7 +282,8 @@ class CACSInferenceService:
         print(filtered_df.head(10).to_string())
 
         self._validate_filtered_df(filtered_df)
-        self._write_debug_csvs(request_id, dicom_df, filtered_df)
+        if self.write_debug_csvs:
+            self._write_debug_csvs(request_id, dicom_df, filtered_df)
 
         study_files = {}
 
@@ -284,7 +316,7 @@ class CACSInferenceService:
             study_labels.append(-1)
 
         if len(study_ids) == 0:
-            raise ValueError("No studies were created after DICOM filtering.")
+            raise StudyInputError("No usable CT series found in the uploaded study.")
 
         input_volume_data = CTChestDataset_nongated(
             study_ids,
@@ -406,12 +438,15 @@ class CACSInferenceService:
 
         with torch.no_grad():
             for i, batch_data in enumerate(input_loader, start=1):
-                study_id, inputs, targets, hu_vols, vox_dims = batch_data
+                study_id, inputs, targets, hu_vols, vox_dims, original_thickness = batch_data
 
                 study_id = study_id[0]
                 safe_study_id = self._safe_study_name(study_id)
+                thickness_info = slice_thickness_report(float(original_thickness[0]))
 
                 print(f"Running AI-CAC inference for study {i}: {study_id}")
+                if thickness_info["warning"]:
+                    print(f"WARNING: {thickness_info['warning']} (study {study_id})")
 
                 pred_vol = self._predict_volume(inputs)
 
@@ -517,6 +552,7 @@ class CACSInferenceService:
                     {
                         "study_id": str(study_id),
                         "ai_cac": ai_cac,
+                        **thickness_info,
                         "mask_dir": mask_dir,
                         "mask_files": mask_files,
                     }

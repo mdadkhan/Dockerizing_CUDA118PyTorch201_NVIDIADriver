@@ -1,1 +1,4 @@
 __pycache__/
+
+# Secrets and environment-specific settings (templates are .env.example)
+.env
