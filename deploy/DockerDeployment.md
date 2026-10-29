@@ -63,7 +63,7 @@ podman run -d --name va-ai-cac \
   --device nvidia.com/gpu=all \
   --shm-size=2g \
   --env-file deploy/.env \
-  -p 5000:25000 \
+  -p 127.0.0.1:5000:25000 \
   -v $(pwd)/storage:/app/storage:Z \
   va-ai-cac:latest
 ```
@@ -95,13 +95,30 @@ podman exec va-ai-cac nvidia-smi
 curl http://localhost:5000/health
 ```
 
+### Authentication
+
+The API requires a token on `/predict` and `/masks/*`.
+
+```bash
+curl -H "X-API-Key: <your-token>" http://localhost:5000/health
+```
+
+Use either of these headers for protected routes:
+- `X-API-Key: <token>`
+- `Authorization: Bearer <token>`
+
 ### Submit CT Study
 
 ```bash
 curl -X POST http://localhost:5000/predict \
+  -H "X-API-Key: <your-token>" \
   -F "study_zip=@/path/to/CT_Study.zip" \
   -F "save_masks=true"
 ```
+
+### TLS Reverse Proxy
+
+Expose this service only through a TLS-terminating reverse proxy (for example, Nginx, Traefik, or an API gateway) and keep the container port bound to localhost (`127.0.0.1`) on the host.
 
 ## Key Configuration Details
 

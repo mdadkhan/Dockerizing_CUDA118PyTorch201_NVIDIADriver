@@ -78,9 +78,11 @@ S3_URL_EXPIRATION=3600
 MODEL_CHECKPOINT_FILE=model/va_non_gated_ai_cac_model.pth
 INFERENCE_BATCH_SIZE=16
 DATALOADER_NUM_WORKERS=4
+API_AUTH_ENABLED=true
+API_AUTH_TOKEN=change-this-token
 
 # Flask server
-FLASK_HOST=0.0.0.0
+FLASK_HOST=127.0.0.1
 FLASK_PORT=25000
 "@ | Out-File -FilePath $EnvFile -Encoding UTF8
         Write-Host "  .env file created - Please update with your values`n" -ForegroundColor Green

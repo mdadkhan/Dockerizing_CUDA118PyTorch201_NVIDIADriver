@@ -23,6 +23,10 @@ def env_flag(name: str, default: str = "false") -> bool:
     return os.environ.get(name, default).lower() in {"true", "1", "yes"}
 
 
+def parse_api_tokens(raw_tokens: str):
+    return {t.strip() for t in raw_tokens.split(",") if t.strip()}
+
+
 # -----------------------------
 # Configuration
 # -----------------------------
@@ -32,6 +36,15 @@ MODEL_CHECKPOINT_FILE = os.environ.get(
     os.path.join("model", "va_non_gated_ai_cac_model.pth"),
 )
 MODEL_SHA256 = os.environ.get("MODEL_SHA256", DEFAULT_MODEL_SHA256)
+
+# API auth
+API_AUTH_ENABLED = env_flag("API_AUTH_ENABLED", "true")
+API_AUTH_TOKENS = parse_api_tokens(os.environ.get("API_AUTH_TOKENS", os.environ.get("API_AUTH_TOKEN", "")))
+if API_AUTH_ENABLED and not API_AUTH_TOKENS:
+    raise ValueError(
+        "API auth is enabled but no token is configured. "
+        "Set API_AUTH_TOKEN or API_AUTH_TOKENS, or set API_AUTH_ENABLED=false for local-only testing."
+    )
 
 # S3 Configuration
 USE_S3_STORAGE = env_flag("USE_S3_STORAGE")
@@ -76,6 +89,34 @@ if not USE_S3_STORAGE:
 app = Flask(__name__)
 # Requests larger than this are rejected with 413 before the upload is stored.
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
+
+
+def extract_request_token() -> str:
+    auth_header = request.headers.get("Authorization", "").strip()
+    if auth_header.lower().startswith("bearer "):
+        return auth_header[7:].strip()
+    return request.headers.get("X-API-Key", "").strip()
+
+
+@app.before_request
+def require_api_auth():
+    if not API_AUTH_ENABLED:
+        return None
+
+    public_paths = {"/", "/health"}
+    if request.path in public_paths:
+        return None
+
+    token = extract_request_token()
+    if token in API_AUTH_TOKENS:
+        return None
+
+    return jsonify(
+        {
+            "success": False,
+            "error": "Unauthorized. Provide a valid API token.",
+        }
+    ), 401
 
 
 # -----------------------------
@@ -407,7 +448,7 @@ print("__name__ is:", __name__)
 
 if __name__ == "__main__":
     # Local development only; the container runs gunicorn and never reaches this.
-    host = os.environ.get("FLASK_HOST", "0.0.0.0")
+    host = os.environ.get("FLASK_HOST", "127.0.0.1")
     port = int(os.environ.get("FLASK_PORT", "25000"))
 
     debug_mode = env_flag("FLASK_DEBUG")

@@ -140,9 +140,9 @@ def main():
       row = {'StudyName': study_id, 'AI-CAC': pred_cacs[0], **thickness_info}
       score_data.append(row)
 
-      # Save predicted masks when enabled or when a positive CAC score is predicted
+      # Save predicted masks only when explicitly enabled.
       try:
-        if SAVE_MASKS or (isinstance(pred_cacs, (list, tuple, np.ndarray)) and pred_cacs[0] > 0) or (not isinstance(pred_cacs, (list, tuple, np.ndarray)) and pred_cacs > 0):
+        if SAVE_MASKS:
           save_path = os.path.join(MASK_FOLDER, study_id)
           os.makedirs(save_path, exist_ok=True)
           save_vol_masks(inputs.cpu().squeeze(), pred_vol.cpu().squeeze(), save_path)

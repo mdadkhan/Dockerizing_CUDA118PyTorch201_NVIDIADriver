@@ -181,6 +181,7 @@ curl http://localhost:25000/health
 
 # Run prediction
 curl -X POST http://localhost:25000/predict \
+    -H "X-API-Key: <your-token>" \
   -F "study_zip=@/path/to/CT_Study.zip" \
   -F "save_masks=true"
 ```
@@ -277,11 +278,13 @@ You can customize behavior with environment variables:
 # Windows (PowerShell)
 $env:MODEL_CHECKPOINT_FILE = "model/va_non_gated_ai_cac_model.pth"
 $env:INFERENCE_BATCH_SIZE = "8"
+$env:API_AUTH_TOKEN = "change-this-token"
 python app.py
 
 # Linux/Mac
 export MODEL_CHECKPOINT_FILE="model/va_non_gated_ai_cac_model.pth"
 export INFERENCE_BATCH_SIZE="8"
+export API_AUTH_TOKEN="change-this-token"
 python app.py
 ```
 
